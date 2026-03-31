@@ -42,13 +42,38 @@ const mcp = new Server(
       },
     },
     instructions: [
-      'Messages from the voice channel arrive as <channel source="voice" request_id="..." user="..." ts="...">.',
+      'Messages from the voice channel arrive as <channel source="voice" request_id="..." user="..." ts="..." detail_level="..." type="...">.',
+      'You MUST call voice_reply with the matching request_id for every message you receive.',
+      '',
+      '## Message types',
+      '',
+      '### type="voice" (default)',
       'The sender is using voice input (speech-to-text). They cannot see your transcript output.',
-      'You MUST call voice_reply with the matching request_id for every voice message you receive.',
       'The response will be converted to speech (TTS) and played back to the user.',
       'Keep responses concise and natural for spoken delivery.',
       'Avoid code blocks, URLs, and markdown formatting in voice replies.',
       'If the task involves complex output, give a spoken summary.',
+      '',
+      '### type="narrate"',
+      'The TTS-service is requesting narration of markdown content for audio playback.',
+      'You MUST reply with a JSON array of section narrations:',
+      '  [{"section_id": "s0", "narration": "..."}, {"section_id": "s1", "narration": "..."}, ...]',
+      'Each section_id is "s" followed by its zero-based index.',
+      'Convert markdown structure into natural, flowing spoken prose.',
+      'Omit raw URLs, code blocks, and formatting artifacts.',
+      'Use transition phrases between sections for a smooth listening experience.',
+      '',
+      '## Detail levels (detail_level in meta)',
+      '',
+      'detail_level="overview": Brief summary. Cover only the key takeaways — roughly 20-30% of the source length.',
+      'detail_level="standard" (default): Balanced narration. Hit the main points with enough context — roughly 40-50% of the source length.',
+      'detail_level="detailed": Thorough narration. Preserve most information and nuance — roughly 60-70% of the source length.',
+      '',
+      '## Speech rules (apply to both types)',
+      'Write for the ear, not the eye. Use short sentences and plain language.',
+      'Never emit raw URLs — describe the link instead ("the GitHub repo", "the docs page").',
+      'Spell out uncommon abbreviations on first use.',
+      'Avoid parenthetical asides; restructure into separate sentences.',
     ].join('\n'),
   },
 )
@@ -145,6 +170,8 @@ const httpServer = Bun.serve({
         const body = (await req.json()) as {
           text: string
           user_id?: string
+          detail_level?: string  // "overview" | "standard" | "detailed"
+          type?: string          // "voice" | "narrate"
         }
 
         if (!body.text || typeof body.text !== 'string') {
@@ -179,6 +206,8 @@ const httpServer = Bun.serve({
                   request_id,
                   user: body.user_id ?? 'voice-user',
                   ts: new Date().toISOString(),
+                  detail_level: body.detail_level ?? 'standard',
+                  type: body.type ?? 'voice',
                 },
               },
             })
