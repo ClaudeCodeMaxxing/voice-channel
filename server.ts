@@ -3,8 +3,8 @@
  * Voice channel for Claude Code.
  *
  * Dual-interface MCP server: stdio for Claude Code communication,
- * HTTP for the orchestrator. Bridges synchronous HTTP request-response
- * to async MCP channel notifications via a pending promise map.
+ * HTTP for the orchestrator. Uses async submit+poll pattern:
+ * POST /voice returns 202 immediately, GET /voice/:id polls for result.
  *
  * Modeled on the Telegram channel plugin pattern.
  */
@@ -21,15 +21,29 @@ import { randomBytes } from 'crypto'
 const HTTP_PORT = parseInt(process.env.VOICE_CHANNEL_PORT ?? '9000', 10)
 const REQUEST_TIMEOUT_MS = parseInt(process.env.VOICE_CHANNEL_TIMEOUT ?? '120000', 10)
 
-// --- Pending request bridge ---
-// Maps request_id -> { resolve, reject, timer } for correlating
-// HTTP requests with MCP voice_reply tool calls.
+// --- Request tracking ---
+// Pending: waiting for Claude's voice_reply tool call.
+// Completed: Claude has replied; orchestrator can poll for the result.
 type PendingRequest = {
-  resolve: (text: string) => void
-  reject: (err: Error) => void
   timer: ReturnType<typeof setTimeout>
+  submitted_at: number
+}
+type CompletedRequest = {
+  response: string
+  elapsed_ms: number
 }
 const pending = new Map<string, PendingRequest>()
+const completed = new Map<string, CompletedRequest>()
+const erroredRequests = new Set<string>()
+
+// Auto-purge completed entries after 5 minutes to prevent memory leaks.
+const COMPLETED_TTL_MS = 5 * 60 * 1000
+function scheduleCompletedCleanup(request_id: string): void {
+  setTimeout(() => {
+    completed.delete(request_id)
+    erroredRequests.delete(request_id)
+  }, COMPLETED_TTL_MS)
+}
 
 // --- MCP Server (stdio, facing Claude Code) ---
 const mcp = new Server(
@@ -140,7 +154,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
   clearTimeout(entry.timer)
   pending.delete(request_id)
-  entry.resolve(text)
+
+  const elapsed_ms = Date.now() - entry.submitted_at
+  completed.set(request_id, { response: text, elapsed_ms })
+  scheduleCompletedCleanup(request_id)
 
   return {
     content: [{ type: 'text', text: `Voice reply sent (${request_id})` }],
@@ -164,7 +181,7 @@ const httpServer = Bun.serve({
       })
     }
 
-    // Voice request endpoint
+    // Voice request endpoint — async submit, returns 202 immediately
     if (url.pathname === '/voice' && req.method === 'POST') {
       try {
         const body = (await req.json()) as {
@@ -182,50 +199,90 @@ const httpServer = Bun.serve({
         }
 
         const request_id = randomBytes(8).toString('hex')
+        const submitted_at = Date.now()
 
-        // Create pending request and await Claude's voice_reply
-        const responseText = await new Promise<string>((resolve, reject) => {
-          const timer = setTimeout(() => {
-            pending.delete(request_id)
-            reject(
-              new Error(
-                `Voice request timed out after ${REQUEST_TIMEOUT_MS}ms`,
-              ),
-            )
-          }, REQUEST_TIMEOUT_MS)
+        // Set up timeout — moves request to error state
+        const timer = setTimeout(() => {
+          pending.delete(request_id)
+          completed.set(request_id, {
+            response: '',
+            elapsed_ms: Date.now() - submitted_at,
+          })
+          // Store as error so poll sees "error" not "pending" forever
+          erroredRequests.add(request_id)
+          scheduleCompletedCleanup(request_id)
+        }, REQUEST_TIMEOUT_MS)
 
-          pending.set(request_id, { resolve, reject, timer })
+        pending.set(request_id, { timer, submitted_at })
 
-          // Push notification into Claude Code session
-          mcp
-            .notification({
-              method: 'notifications/claude/channel',
-              params: {
-                content: body.text,
-                meta: {
-                  request_id,
-                  user: body.user_id ?? 'voice-user',
-                  ts: new Date().toISOString(),
-                  detail_level: body.detail_level ?? 'standard',
-                  type: body.type ?? 'voice',
-                },
+        // Push notification into Claude Code session (fire-and-forget)
+        mcp
+          .notification({
+            method: 'notifications/claude/channel',
+            params: {
+              content: body.text,
+              meta: {
+                request_id,
+                user: body.user_id ?? 'voice-user',
+                ts: new Date().toISOString(),
+                detail_level: body.detail_level ?? 'standard',
+                type: body.type ?? 'voice',
               },
-            })
-            .catch(err => {
-              clearTimeout(timer)
-              pending.delete(request_id)
-              reject(
-                new Error(`Failed to deliver to Claude: ${err}`),
-              )
-            })
-        })
+            },
+          })
+          .catch(err => {
+            clearTimeout(timer)
+            pending.delete(request_id)
+            completed.set(request_id, { response: '', elapsed_ms: Date.now() - submitted_at })
+            erroredRequests.add(request_id)
+            scheduleCompletedCleanup(request_id)
+            process.stderr.write(`voice-channel: failed to deliver to Claude: ${err}\n`)
+          })
 
-        return Response.json({ response: responseText, request_id })
+        return Response.json({ request_id, status: 'pending' }, { status: 202 })
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        const status = msg.includes('timed out') ? 504 : 500
-        return Response.json({ error: msg }, { status })
+        return Response.json({ error: msg }, { status: 500 })
       }
+    }
+
+    // Poll for voice request result
+    const pollMatch = url.pathname.match(/^\/voice\/([a-f0-9]+)$/)
+    if (pollMatch && req.method === 'GET') {
+      const request_id = pollMatch[1]
+
+      // Check completed (success or error)
+      const done = completed.get(request_id)
+      if (done) {
+        if (erroredRequests.has(request_id)) {
+          erroredRequests.delete(request_id)
+          completed.delete(request_id)
+          return Response.json({
+            request_id,
+            status: 'error',
+            error: 'Voice request timed out or failed to deliver',
+            elapsed_ms: done.elapsed_ms,
+          })
+        }
+        return Response.json({
+          request_id,
+          status: 'completed',
+          response: done.response,
+          elapsed_ms: done.elapsed_ms,
+        })
+      }
+
+      // Check still pending
+      if (pending.has(request_id)) {
+        const entry = pending.get(request_id)!
+        return Response.json({
+          request_id,
+          status: 'pending',
+          elapsed_ms: Date.now() - entry.submitted_at,
+        })
+      }
+
+      return Response.json({ error: `Unknown request_id: ${request_id}` }, { status: 404 })
     }
 
     return Response.json({ error: 'Not found' }, { status: 404 })
@@ -243,10 +300,11 @@ function shutdown(): void {
   shuttingDown = true
   process.stderr.write('voice-channel: shutting down\n')
 
-  // Reject all pending requests so orchestrator gets errors instead of hanging
+  // Move all pending requests to error state so orchestrator sees them on next poll
   for (const [id, entry] of pending) {
     clearTimeout(entry.timer)
-    entry.reject(new Error('Voice channel shutting down'))
+    completed.set(id, { response: '', elapsed_ms: Date.now() - entry.submitted_at })
+    erroredRequests.add(id)
     pending.delete(id)
   }
 
