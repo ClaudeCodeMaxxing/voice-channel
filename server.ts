@@ -189,6 +189,11 @@ const httpServer = Bun.serve({
           user_id?: string
           detail_level?: string  // "overview" | "standard" | "detailed"
           type?: string          // "voice" | "narrate"
+          files?: Array<{
+            path: string
+            filename: string
+            mime_type: string
+          }>
         }
 
         if (!body.text || typeof body.text !== 'string') {
@@ -215,12 +220,23 @@ const httpServer = Bun.serve({
 
         pending.set(request_id, { timer, submitted_at })
 
+        // Build notification content — enrich with file metadata when present
+        let content: string
+        if (body.files && body.files.length > 0) {
+          const fileLines = body.files.map(f =>
+            `[${body.text} (${f.mime_type}) — ${f.path}. Use the Read tool to view it.]`
+          )
+          content = fileLines.join('\n')
+        } else {
+          content = body.text
+        }
+
         // Push notification into Claude Code session (fire-and-forget)
         mcp
           .notification({
             method: 'notifications/claude/channel',
             params: {
-              content: body.text,
+              content,
               meta: {
                 request_id,
                 user: body.user_id ?? 'voice-user',
