@@ -28,9 +28,17 @@ type PendingRequest = {
   timer: ReturnType<typeof setTimeout>
   submitted_at: number
 }
+type ReplyMetadata = {
+  mode?: string
+  citations?: Array<{ file: string; anchor: string; snippet: string }>
+  current_concept?: string | null
+  session_state?: 'active' | 'ended'
+}
+
 type CompletedRequest = {
   response: string
   elapsed_ms: number
+  metadata?: ReplyMetadata
 }
 const pending = new Map<string, PendingRequest>()
 const completed = new Map<string, CompletedRequest>()
@@ -77,6 +85,12 @@ const mcp = new Server(
       'Omit raw URLs, code blocks, and formatting artifacts.',
       'Use transition phrases between sections for a smooth listening experience.',
       '',
+      '### type="text"',
+      'The sender is using a text client (chat UI). They CAN see your full transcript.',
+      'You may use light markdown structure but keep replies concise (still no walls of text).',
+      'Populate the turn envelope metadata in voice_reply (mode, citations, etc.) so the',
+      'orchestrator can return structured data to the client.',
+      '',
       '## Detail levels (detail_level in meta)',
       '',
       'detail_level="overview": Brief summary. Cover only the key takeaways — roughly 20-30% of the source length.',
@@ -106,18 +120,50 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'voice_reply',
       description:
-        'Send a response back to the voice caller. You MUST call this for every voice message you receive. ' +
-        'The text will be converted to speech (TTS) and played back. Keep responses concise and natural for spoken delivery.',
+        'Send a response back to the channel caller. You MUST call this for every channel message you receive. ' +
+        'The text will be converted to speech (TTS) when type=voice; for type=text it will be returned as-is. ' +
+        'For study sessions, populate the optional metadata fields (mode, citations, current_concept, session_state) ' +
+        'so the orchestrator can construct the turn envelope.',
       inputSchema: {
         type: 'object',
         properties: {
           request_id: {
             type: 'string',
-            description: 'The request_id from the inbound voice message. Must match exactly.',
+            description: 'The request_id from the inbound message. Must match exactly.',
           },
           text: {
             type: 'string',
-            description: 'Your response text. Will be spoken via TTS. Keep it natural and concise.',
+            description: 'Your response text. Will be spoken via TTS when type=voice.',
+          },
+          mode: {
+            type: 'string',
+            description:
+              'Study mode for the turn. One of: open-recall, statute-drill, hypothetical, ' +
+              'socratic-followup, explain-gap, drill-exception, summary. Optional.',
+          },
+          citations: {
+            type: 'array',
+            description:
+              'Structured citations from the grading rubric. Each is {file, anchor, snippet}. ' +
+              'Empty array for non-grading turns. Optional.',
+            items: {
+              type: 'object',
+              properties: {
+                file: { type: 'string' },
+                anchor: { type: 'string' },
+                snippet: { type: 'string' },
+              },
+              required: ['file', 'anchor', 'snippet'],
+            },
+          },
+          current_concept: {
+            type: ['string', 'null'],
+            description: 'Slug of the concept the turn is about. Null if no concept active. Optional.',
+          },
+          session_state: {
+            type: 'string',
+            enum: ['active', 'ended'],
+            description: 'Logical session state. "ended" closes the study session. Optional, defaults to "active".',
           },
         },
         required: ['request_id', 'text'],
@@ -134,10 +180,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     }
   }
 
-  const { request_id, text } = req.params.arguments as {
+  const args = req.params.arguments as {
     request_id: string
     text: string
+    mode?: string
+    citations?: Array<{ file: string; anchor: string; snippet: string }>
+    current_concept?: string | null
+    session_state?: 'active' | 'ended'
   }
+  const { request_id, text } = args
 
   const entry = pending.get(request_id)
   if (!entry) {
@@ -156,7 +207,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   pending.delete(request_id)
 
   const elapsed_ms = Date.now() - entry.submitted_at
-  completed.set(request_id, { response: text, elapsed_ms })
+  const metadata: ReplyMetadata = {
+    mode: args.mode,
+    citations: args.citations,
+    current_concept: args.current_concept,
+    session_state: args.session_state ?? 'active',
+  }
+  completed.set(request_id, { response: text, elapsed_ms, metadata })
   scheduleCompletedCleanup(request_id)
 
   return {
@@ -285,6 +342,7 @@ const httpServer = Bun.serve({
           status: 'completed',
           response: done.response,
           elapsed_ms: done.elapsed_ms,
+          metadata: done.metadata ?? {},
         })
       }
 
